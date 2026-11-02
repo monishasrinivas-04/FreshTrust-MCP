@@ -1,0 +1,30 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/*.sqlite3
+data/*.db
+data/*.jsonl
+logs/
+.DS_Store
+# Environment and secrets
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE and system
+.vscode/
+.idea/
+.DS_Store
+desktop.ini
+
+# Generated files
+.cache/
+logs/
+data/
