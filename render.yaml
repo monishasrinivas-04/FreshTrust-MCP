@@ -9,6 +9,10 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      - key: GITHUB_MCP_URL
+        value: https://api.githubcopilot.com/mcp/
+      - key: DATABASE_URL
+        sync: false
       - key: CLOUDFLARE_ACCOUNT_ID
         sync: false
       - key: CLOUDFLARE_API_TOKEN

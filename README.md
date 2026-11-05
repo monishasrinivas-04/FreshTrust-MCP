@@ -1,78 +1,92 @@
-# FreshTrust-MCP
+FRESHTRUST-MCP REPLACEMENT FILES
 
-Secure, adaptive and freshness-aware GitHub repository intelligence using MCP, LangGraph, semantic RAG and hosted inference.
+Copy these five files into the matching locations in your existing project:
+- app.py
+- agents/orchestrator.py
+- mcp_layer/github_client.py
+- rag/retriever.py
+- config/settings.py
 
-## Important deployment notes
+The uploaded app.py is preserved because it already has the correct UI:
+Public = URL + question only.
+Private = URL + question + user-entered PAT.
 
-- The original Kaggle notebook uses local Qwen3-14B. The deployed path does not load model weights.
-- The default hosted model is Cloudflare `@cf/qwen/qwen3.8-27b`, **not** Qwen3-14B. Verify account eligibility and model access before deployment.
-- Cloudflare Workers AI documents a 10,000-Neuron/day free allocation; exceeding it fails on Workers Free rather than automatically billing. Model-specific eligibility can change. See the official pricing and model pages.
-- Render Free web services sleep when idle and have ephemeral local storage. SQLite cache on Render is therefore demonstrative, not durable.
-- GitHub MCP access and Cloudflare inference require user-configured credentials. Never commit them.
+.env contains application configuration only:
+GITHUB_MCP_URL=https://api.githubcopilot.com/mcp/
+CLOUDFLARE_ACCOUNT_ID=...
+CLOUDFLARE_API_TOKEN=...
+CLOUDFLARE_MODEL=...
 
-## Local setup (Windows PowerShell)
+Remove any GITHUB_MCP_TOKEN line from .env. The application does not read a
+developer-owned GitHub token. A private user's PAT is passed to the MCP client
+for that request only. It is not stored in LangGraph state, cache, prompt, log,
+or returned result. Commit metadata is obtained using the MCP list_commits tool;
+the RAG retriever contains no GitHub REST calls.
 
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-Copy-Item .env.example .env
-```
+IMPORTANT PUBLIC-ENDPOINT LIMITATION:
+The public workflow does not ask the user for a PAT. However, if the configured
+remote MCP endpoint returns HTTP 401 without an Authorization header, that
+endpoint is enforcing gateway authentication even for public repositories.
+This code intentionally does not hide that limitation by using a global
+developer token. To meet the no-prompt public workflow, configure an MCP
+gateway that permits anonymous public reads or implement end-user OAuth.
+For private repositories, the UI-supplied PAT is sent as Authorization: Bearer.
 
-Edit `.env` locally. Set `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN`. Do not paste secrets into chat or commit `.env`.
+GitHub's remote MCP documentation describes the Bearer PAT header:
+https://docs.github.com/en/copilot/how-tos/copilot-in-your-ide/customize-copilot/extend-copilot-with-tools-and-context/set-up-the-github-mcp-server
 
-```powershell
+Run from the project root:
 python app.py
-```
 
-Open the local Gradio URL printed in the terminal.
+This is a source replacement bundle; no claim is made that it has been run
+against your local environment. Keep your existing requirements.txt and
+other modules unchanged.
 
-## Tests
+FRESHTRUST-MCP — MCP-ONLY CHANGE SET
 
-```powershell
-pytest -q
-python -m compileall .
-```
+Replace/add ONLY these files:
+- mcp_layer/github_client.py       (replace)
+- agents/orchestrator.py           (replace)
+- rag/retriever.py                 (replace; only commit-metadata source changed)
+- security/request_secret.py       (new)
 
-## VS Code
+Leave app.py, Gradio UI, Cloudflare LLM, embeddings, chunking, reranking,
+context refinement, cache, evaluation, settings, and requirements unchanged.
 
-1. Open this folder in VS Code.
-2. Press `Ctrl+Shift+P` → Python: Select Interpreter → choose `.venv`.
-3. Open Terminal → New Terminal and activate `.venv`.
-4. Run the setup and test commands above.
+BEHAVIOUR
+Public repository:
+- User enters repository URL and question.
+- No PAT is requested or sent.
+- No GITHUB_MCP_TOKEN or shared server-side GitHub token is read.
 
-If PowerShell blocks activation, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in that terminal only, then activate again.
+Private repository:
+- User enters URL, question, and PAT using the existing UI.
+- PAT is encrypted with AES-256-GCM in a request-local envelope.
+- It is not included in LangGraph state and is not written to disk, cache,
+  prompts, logs, or returned results.
+- It is decrypted only when the retrieval node needs to establish the MCP
+  connection. The MCP Authorization header is sent over HTTPS.
 
-## Deployment
+MCP / LANGGRAPH
+- Repository file search and retrieval use GitHub MCP tools only.
+- Commit metadata for freshness is retrieved through MCP list_commits.
+- No direct GitHub REST calls remain in the replaced retriever.
+- Existing LangGraph node sequence and RAG ranking/embedding logic are retained.
+- Existing rate-limit cache fallback is retained.
 
-1. Push the project to a GitHub repository.
-2. Create a Render Web Service from that repository.
-3. Use `render.yaml` or set build command `pip install -r requirements.txt` and start command `python app.py`.
-4. Add the Cloudflare credentials in Render Environment.
-5. Confirm that the account/model can serve a request under the free allocation before sharing the app.
+IMPORTANT PUBLIC ENDPOINT LIMITATION
+Your previous call to https://api.githubcopilot.com/mcp/ returned 401 when no
+Authorization header was sent. This replacement intentionally sends no token
+for public repositories, exactly as requested. Therefore the MCP endpoint
+configured by GITHUB_MCP_URL must permit anonymous public reads. If that
+endpoint continues to return 401, use an MCP server/gateway configured to allow
+anonymous public repository access. Do not add a shared developer token.
 
-No paid fallback is configured. HTTP 402/403/429 or provider errors stop generation with an explicit error.
+No new .env variable is needed. Keep GITHUB_MCP_URL and your existing Cloudflare
+configuration. Remove GITHUB_MCP_TOKEN if it exists.
 
-## Architecture
+Run normally:
+    python app.py
 
-User → Gradio → LangGraph StateGraph → input validation → GitHub MCP retrieval → chunking/embeddings → freshness scoring and combined ranking → context refinement → Cloudflare Workers AI → cited response.
-
-## Security notes
-
-- User GitHub PAT is request-scoped and not written to disk by the application.
-- TLS is expected from the hosting platform and remote APIs.
-- MCP tool names are allow-listed and repository owner/name are checked.
-- AES-GCM helpers are included only for a future use case requiring encrypted persistence; default behavior does not persist PATs.
-- This is not WhatsApp-style end-to-end encryption. The backend must use the GitHub credential to access the repository.
-- Treat repository content as untrusted evidence; prompt injection cannot be solved by encryption alone.
-
-## Known limitations to validate
-
-- GitHub Copilot MCP tool names/schemas and account access can change. The adapter discovers tools and supports a constrained schema mapping; test against your account.
-- Search-result parsing depends on the GitHub MCP response shape. Inspect and extend parsing if your MCP server returns a different format.
-- Semantic embeddings may be memory-intensive on a free web host. The code falls back to lexical scoring if the embedding model cannot load; this is explicitly reported in latency metadata.
-- Current implementation uses SQLite caching, not PostgreSQL/pgvector.
-- Freshness is incorporated into a weighted ranking score, but the weights need empirical calibration.
-- Private repository token forwarding to GitHub MCP depends on the endpoint's accepted authentication mechanism.
-- End-to-end evaluation requires a labelled repository-question dataset; the included tests are smoke tests, not benchmark evidence.
+No diagnostic or smoke-test commands are included. This is a source replacement
+package and has not been executed against your live MCP endpoint.

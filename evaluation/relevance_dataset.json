@@ -1,0 +1,25 @@
+[
+  {
+    "id": "Q001",
+    "query": "Where is GitHub repository access implemented?",
+    "relevant_files": [
+      "mcp_layer/github_client.py",
+      "rag/retriever.py"
+    ]
+  },
+  {
+    "id": "Q002",
+    "query": "Where is freshness calculated?",
+    "relevant_files": [
+      "rag/freshness.py"
+    ]
+  },
+  {
+    "id": "Q003",
+    "query": "Where is the LLM response generated?",
+    "relevant_files": [
+      "llm/cloudflare_client.py",
+      "agents/orchestrator.py"
+    ]
+  }
+]

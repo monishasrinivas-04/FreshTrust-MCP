@@ -1,30 +1,33 @@
-.env
-.venv/
-__pycache__/
-.pytest_cache/
-*.py[cod]
-data/*.sqlite3
-data/*.db
-data/*.jsonl
-logs/
-.DS_Store
 # Environment and secrets
 .env
+.env.*
+!.env.example
+
+# Python environments
 .venv/
 venv/
 
-# Python
+# Python cache and test artifacts
 __pycache__/
 *.py[cod]
 .pytest_cache/
 
-# IDE and system
+# IDE and system files
 .vscode/
 .idea/
 .DS_Store
 desktop.ini
 
-# Generated files
+# Generated files and local data
 .cache/
 logs/
 data/
+*.sqlite3
+*.db
+*.jsonl
+
+# Temporary debugging and source snapshots
+github_client_current.txt
+orchestrator_current.txt
+debug_mcp_file.py
+list_mcp_tools.py

@@ -1,3 +1,4 @@
+
 from functools import lru_cache
 from hashlib import sha256
 from pathlib import Path
@@ -43,6 +44,7 @@ def _read_cached(keys):
     found = {}
     if not keys:
         return found
+
     try:
         with _connect_cache() as conn:
             for key in keys:
@@ -50,19 +52,22 @@ def _read_cached(keys):
                     "SELECT vector, dimension FROM embeddings WHERE cache_key = ?",
                     (key,),
                 ).fetchone()
+
                 if row:
                     vector = np.frombuffer(row[0], dtype=np.float32)
                     if vector.size == row[1]:
                         found[key] = vector.copy()
+
     except (sqlite3.Error, OSError):
-        # Cache failure must never prevent repository analysis.
         return {}
+
     return found
 
 
 def _write_cached(items):
     if not items:
         return
+
     try:
         with _connect_cache() as conn:
             conn.executemany(
@@ -71,26 +76,47 @@ def _write_cached(items):
                 VALUES (?, ?, ?)
                 """,
                 [
-                    (key, np.asarray(vector, dtype=np.float32).tobytes(), int(vector.size))
+                    (
+                        key,
+                        np.asarray(vector, dtype=np.float32).tobytes(),
+                        int(vector.size),
+                    )
                     for key, vector in items.items()
                 ],
             )
+
     except (sqlite3.Error, OSError):
-        # Inference still succeeds when the local cache cannot be written.
         pass
 
 
-def embed_texts(texts):
+def embed_texts(texts, use_cache=True):
     """
-    Return normalized embeddings, reusing vectors stored in a local SQLite cache.
-    Missing texts are encoded together in one batch for efficient model inference.
+    Return normalized embeddings.
+
+    When use_cache=False, bypass persistent SQLite storage entirely.
     """
     texts = [str(text) for text in texts]
+
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
 
+    # Private requests bypass persistent storage completely.
+    if not use_cache:
+        model = get_embedder()
+
+        vectors = model.encode(
+            texts,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+            batch_size=32,
+        )
+
+        return np.asarray(vectors, dtype=np.float32)
+
     keys = [_cache_key(text) for text in texts]
     cached = _read_cached(list(dict.fromkeys(keys)))
+
     missing_texts = []
     missing_keys = []
     seen_missing = set()
@@ -103,6 +129,7 @@ def embed_texts(texts):
 
     if missing_texts:
         model = get_embedder()
+
         vectors = model.encode(
             missing_texts,
             normalize_embeddings=True,
@@ -110,23 +137,31 @@ def embed_texts(texts):
             show_progress_bar=False,
             batch_size=32,
         )
+
         vectors = np.asarray(vectors, dtype=np.float32)
+
         if vectors.ndim == 1:
             vectors = vectors.reshape(1, -1)
+
         new_vectors = {
             key: vector for key, vector in zip(missing_keys, vectors)
         }
+
         _write_cached(new_vectors)
         cached.update(new_vectors)
 
-    return np.vstack([cached[key] for key in keys]).astype(np.float32, copy=False)
+    return np.vstack(
+        [cached[key] for key in keys]
+    ).astype(np.float32, copy=False)
 
 
 def lexical_fallback(query, texts):
     """Deterministic fallback if the embedding package cannot initialize."""
     q = set(query.lower().split())
     scores = []
+
     for text in texts:
         t = set(text.lower().split())
         scores.append(len(q & t) / max(1, len(q)))
+
     return np.asarray(scores, dtype=float), "lexical_fallback"
