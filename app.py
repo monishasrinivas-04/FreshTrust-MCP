@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
 import time
@@ -128,6 +130,78 @@ def discover_private_repositories(github_token):
         )
 
 
+def _token_fingerprint(token):
+    return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
+
+def verify_private_repository(github_token, private_repository, question):
+    """Verify PAT access to the selected private repo without fetching its files."""
+    token_value = (github_token or "").strip()
+    selected = (private_repository or "").strip()
+    if not token_value:
+        return None, gr.update(visible=False), "Enter your GitHub PAT first."
+    if not selected or "/" not in selected:
+        return None, gr.update(visible=False), "Select a private repository first."
+    if not question or not question.strip():
+        return None, gr.update(visible=False), "Enter your question before requesting access."
+    try:
+        repositories = GitHubMCPClient.discover_repositories(token_value)
+        accessible = {item.get("full_name", "").casefold() for item in repositories}
+        if selected.casefold() not in accessible:
+            return None, gr.update(visible=False), (
+                "The selected repository is not accessible with this PAT. "
+                "No repository contents were retrieved."
+            )
+        context = {
+            "repository": selected,
+            "question": question.strip(),
+            "token_fingerprint": _token_fingerprint(token_value),
+        }
+        notice = (
+            "### Private repository access approval\n\n"
+            f"**Repository:** `{selected}`\n\n"
+            "GitHub verified your PAT and repository access. If you approve, "
+            "FreshTrust-MCP will perform read-only code search, file retrieval "
+            "and commit-metadata retrieval, then use the retrieved content to "
+            "answer your question. Your PAT is not stored in this approval record "
+            "or the evaluation database. No file retrieval starts until you approve."
+        )
+        return context, gr.update(visible=True), notice
+    except Exception as exc:
+        logger.warning("Private repository verification failed (%s).", type(exc).__name__)
+        return None, gr.update(visible=False), (
+            "GitHub could not verify this PAT and repository. Check token permissions "
+            "and repository access. No repository contents were retrieved."
+        )
+
+def approve_private_access(verified_context, github_token, private_repository, question):
+    token_value = (github_token or "").strip()
+    selected = (private_repository or "").strip()
+    if not isinstance(verified_context, dict) or not token_value:
+        return None, "Verify the PAT and repository before approving access."
+    same_request = (
+        verified_context.get("repository") == selected
+        and verified_context.get("question") == (question or "").strip()
+        and hmac.compare_digest(
+            verified_context.get("token_fingerprint", ""),
+            _token_fingerprint(token_value),
+        )
+    )
+    if not same_request:
+        return None, "The PAT, repository or question changed. Verify again before approving."
+    approved = dict(verified_context)
+    approved["approved"] = True
+    return approved, (
+        f"**Access approved for `{selected}`.** Select **Analyze repository** to run "
+        "this approved analysis. Approval is consumed by that attempt."
+    )
+
+def decline_private_access():
+    return None, None, "Access declined. No private repository content was retrieved and no answer was generated."
+
+def invalidate_private_consent():
+    return None, None, "Request changed. Verify the repository and request consent again."
+
+
 # --------------------------------------------------
 # 5. EVALUATION DISPLAY HELPERS
 # --------------------------------------------------
@@ -206,6 +280,7 @@ def ask(
     private_repository,
     question,
     expected_relevant_files,
+    private_approval,
 ):
     run_started = time.perf_counter()
 
@@ -214,7 +289,7 @@ def ask(
         if not selected or "/" not in selected:
             return (
                 "Enter your PAT, discover repositories, and select a private repository.",
-                [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Repository selection required",
+                [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Repository selection required", None,
             )
         repo_key = f"https://github.com/{selected}"
     else:
@@ -222,20 +297,39 @@ def ask(
         if not repo_key:
             return (
                 "Please enter a public GitHub repository URL.",
-                [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Not run",
+                [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Not run", private_approval,
             )
 
     if not question or not question.strip():
         return (
             "Please enter a question about the repository.",
-            [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Not run",
+            [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Not run", private_approval,
         )
 
     if visibility == "Private" and not (github_token and github_token.strip()):
         return (
             "A GitHub Personal Access Token is required for private repositories.",
-            [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Authentication required",
+            [], [], [], [], "Metrics will appear after a successful analysis.", _history_rows(), "Authentication required", None,
         )
+
+    if visibility == "Private":
+        valid_approval = (
+            isinstance(private_approval, dict)
+            and private_approval.get("approved") is True
+            and private_approval.get("repository") == selected
+            and private_approval.get("question") == question.strip()
+            and hmac.compare_digest(
+                private_approval.get("token_fingerprint", ""),
+                _token_fingerprint(github_token),
+            )
+        )
+        if not valid_approval:
+            return (
+                "Private repository access has not been approved. Verify the repository, "
+                "review the access notice, and select Allow access before analyzing.",
+                [], [], [], [], "Metrics will appear after a successful analysis.",
+                _history_rows(), "Consent required", None,
+            )
 
     try:
         logger.info(
@@ -336,7 +430,7 @@ def ask(
             ])
 
         status = (
-            f"Success Â· {result.get('retrieval_mode', 'unknown')} retrieval Â· "
+            f"Success · {result.get('retrieval_mode', 'unknown')} retrieval · "
             f"{result.get('model', 'Qwen')}"
         )
 
@@ -351,6 +445,7 @@ def ask(
             _metric_summary_markdown(metrics),
             _history_rows(),
             status,
+            None,
         )
 
     except Exception as exc:
@@ -376,7 +471,7 @@ def ask(
 
         return (
             error_message,
-            [], [], [], [], "Metrics unavailable because this analysis failed.", _history_rows(), "Failed",
+            [], [], [], [], "Metrics unavailable because this analysis failed.", _history_rows(), "Failed", None,
         )
 
 
@@ -449,7 +544,7 @@ with gr.Blocks(
                 Secure, adaptive and freshness-aware repository intelligence
             </p>
             <small>
-                GitHub MCP retrieval Â· Semantic RAG Â· Source freshness Â·
+                GitHub MCP retrieval · Semantic RAG · Source freshness ·
                 Evidence-grounded answers
             </small>
         </div>
@@ -494,6 +589,16 @@ with gr.Blocks(
         "Public mode: enter the repository URL. Access is anonymous; no login, OAuth, PAT, or admin key is required."
     )
     discovery_status = gr.Markdown()
+
+    verified_private_context = gr.State(value=None)
+    approved_private_context = gr.State(value=None)
+    verify_private_button = gr.Button(
+        "Verify repository and request access approval", visible=False
+    )
+    consent_notice = gr.Markdown(visible=False)
+    with gr.Row(visible=False) as consent_actions:
+        approve_private_button = gr.Button("Allow access", variant="primary")
+        decline_private_button = gr.Button("Decline", variant="secondary")
 
     question = gr.Textbox(
         label="Ask about the repository",
@@ -622,6 +727,7 @@ with gr.Blocks(
         private_repo,
         question,
         expected_relevant_files,
+        approved_private_context,
     ]
 
     outputs = [
@@ -633,6 +739,7 @@ with gr.Blocks(
         metrics_summary,
         history,
         status,
+        approved_private_context,
     ]
 
     visibility.change(
@@ -645,6 +752,47 @@ with gr.Blocks(
         fn=discover_private_repositories,
         inputs=[token],
         outputs=[private_repo, discovery_status],
+    )
+
+    visibility.change(
+        fn=lambda mode: gr.update(visible=(mode == "Private")),
+        inputs=[visibility],
+        outputs=[verify_private_button],
+    )
+    visibility.change(
+        fn=decline_private_access,
+        inputs=[],
+        outputs=[verified_private_context, approved_private_context, consent_notice],
+    )
+
+    verify_private_button.click(
+        fn=verify_private_repository,
+        inputs=[token, private_repo, question],
+        outputs=[verified_private_context, consent_actions, consent_notice],
+    )
+    approve_private_button.click(
+        fn=approve_private_access,
+        inputs=[verified_private_context, token, private_repo, question],
+        outputs=[approved_private_context, consent_notice],
+    )
+    decline_private_button.click(
+        fn=decline_private_access,
+        inputs=[],
+        outputs=[verified_private_context, approved_private_context, consent_notice],
+    )
+
+    # Editing any request input invalidates verification and approval.
+    for component in (token, private_repo, question):
+        component.change(
+            fn=invalidate_private_consent,
+            inputs=[],
+            outputs=[verified_private_context, approved_private_context, consent_notice],
+        )
+
+    clear.click(
+        fn=decline_private_access,
+        inputs=[],
+        outputs=[verified_private_context, approved_private_context, consent_notice],
     )
 
     submit.click(

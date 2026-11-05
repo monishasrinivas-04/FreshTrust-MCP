@@ -64,12 +64,21 @@ def _normalise_visibility(visibility: Optional[str]) -> str:
 
 
 def _server_parameters(token: Optional[str] = None, public_oauth: bool = False):
-    env = os.environ.copy()
-    env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
+    """
+    Build stdio parameters for the official GitHub MCP Server.
+
+    Private-repository requests launch the native executable bundled in the
+    Render Docker image. The PAT is passed only to this request-scoped child
+    process; it is not written to disk or added to Render's environment.
+
+    The legacy public_oauth/Docker branch is retained for compatibility with
+    _PersistentPublicMCP. The active public-repository retrieval path does not
+    use that helper and remains unchanged.
+    """
     if public_oauth:
+        env = os.environ.copy()
+        env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
         port = settings.github_mcp_oauth_callback_port
-        # Match GitHub's documented Docker OAuth configuration exactly:
-        # publish the fixed callback to loopback and pass the callback port.
         env["GITHUB_OAUTH_CALLBACK_PORT"] = str(port)
         args = [
             "run", "-i", "--rm",
@@ -78,18 +87,28 @@ def _server_parameters(token: Optional[str] = None, public_oauth: bool = False):
             "-e", f"GITHUB_TOOLSETS={settings.github_mcp_toolsets}",
             settings.github_mcp_image, "stdio", "--read-only",
         ]
-    else:
-        args = [
-            "run", "--rm", "-i",
-            "-e", f"GITHUB_TOOLSETS={settings.github_mcp_toolsets}",
-            settings.github_mcp_image, "stdio", "--read-only",
-        ]
-        if token and token.strip():
-            env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token.strip()
-            args[3:3] = ["-e", "GITHUB_PERSONAL_ACCESS_TOKEN"]
+        return StdioServerParameters(
+            command=settings.github_mcp_docker_command,
+            args=args,
+            env=env,
+        )
+
+    binary_path = os.getenv(
+        "GITHUB_MCP_BINARY_PATH",
+        "/usr/local/bin/github-mcp-server",
+    )
+
+    env = os.environ.copy()
+    env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
+    env["GITHUB_TOOLSETS"] = settings.github_mcp_toolsets
+    env["GITHUB_READ_ONLY"] = "1"
+
+    if token and token.strip():
+        env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token.strip()
+
     return StdioServerParameters(
-        command=settings.github_mcp_docker_command,
-        args=args,
+        command=binary_path,
+        args=["stdio"],
         env=env,
     )
 
