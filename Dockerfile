@@ -1,6 +1,6 @@
 # Build the official GitHub MCP Server as a native executable.
 # The current upstream go.mod requires Go 1.25.12.
-FROM golang:1.25.12-alpine AS github-mcp-build
+FROM golang:1.27.3-alpine AS github-mcp-build
 
 RUN apk add --no-cache git ca-certificates
 
