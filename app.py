@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import hmac
 import logging
 import os
@@ -15,7 +16,9 @@ from pathlib import Path
 
 import gradio as gr
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+from urllib.parse import parse_qs
 import uvicorn
 
 from agents.orchestrator import run_query
@@ -27,6 +30,11 @@ from evaluation.metrics import (
 )
 from mcp_layer.github_client import GitHubMCPClient, close_public_mcp
 from security.redaction import redact
+from security.email_approval import (
+    create_pending_approval, send_approval_email, get_approval_page,
+    decide_approval, consume_approved_request, mark_email_failed,
+    get_repository_approver_email,
+)
 
 
 # --------------------------------------------------
@@ -81,10 +89,8 @@ def toggle_repository_mode(visibility):
             gr.update(visible=True, value=None, choices=[]),
             gr.update(visible=True, value=""),
             gr.update(visible=True),
-            "Private mode: enter your PAT, then discover and select a repository. "
-            "The PAT is used for the current request and is not saved.",
+            "Private mode: enter your PAT, discover and select a repository. Approval is sent to the server-configured repository owner/admin.",
         )
-
     return (
         gr.update(visible=True, value=""),
         gr.update(visible=False, value=None, choices=[]),
@@ -133,73 +139,69 @@ def discover_private_repositories(github_token):
 def _token_fingerprint(token):
     return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
 
-def verify_private_repository(github_token, private_repository, question):
-    """Verify PAT access to the selected private repo without fetching its files."""
+def request_private_email_approval(github_token, private_repository, question):
+    """Verify PAT access without reading files, then email the configured repo admin."""
     token_value = (github_token or "").strip()
     selected = (private_repository or "").strip()
     if not token_value:
-        return None, gr.update(visible=False), "Enter your GitHub PAT first."
+        return None, "Enter your GitHub PAT first."
     if not selected or "/" not in selected:
-        return None, gr.update(visible=False), "Select a private repository first."
+        return None, "Select a private repository first."
     if not question or not question.strip():
-        return None, gr.update(visible=False), "Enter your question before requesting access."
+        return None, "Enter your question before requesting approval."
     try:
+        approver_email = get_repository_approver_email(selected)
         repositories = GitHubMCPClient.discover_repositories(token_value)
         accessible = {item.get("full_name", "").casefold() for item in repositories}
         if selected.casefold() not in accessible:
-            return None, gr.update(visible=False), (
-                "The selected repository is not accessible with this PAT. "
-                "No repository contents were retrieved."
-            )
-        context = {
+            return None, "The selected repository is not accessible with this PAT. No repository contents were retrieved and no email was sent."
+        request_id, raw_token = create_pending_approval(
+            approver_email=approver_email, repository=selected,
+            question=question, pat_fingerprint=_token_fingerprint(token_value),
+        )
+        try:
+            send_approval_email(approver_email, selected, question, raw_token)
+        except Exception:
+            mark_email_failed(request_id)
+            raise
+        request_context = {
+            "request_id": request_id,
             "repository": selected,
             "question": question.strip(),
             "token_fingerprint": _token_fingerprint(token_value),
         }
-        notice = (
-            "### Private repository access approval\n\n"
-            f"**Repository:** `{selected}`\n\n"
-            "GitHub verified your PAT and repository access. If you approve, "
-            "FreshTrust-MCP will perform read-only code search, file retrieval "
-            "and commit-metadata retrieval, then use the retrieved content to "
-            "answer your question. Your PAT is not stored in this approval record "
-            "or the evaluation database. No file retrieval starts until you approve."
+        return request_context, (
+            f"**Owner/admin approval email sent to `{approver_email}`.** "
+            f"The configured approver must approve or reject access to `{selected}`. "
+            "The link expires in 10 minutes. After approval, return here and "
+            "click **Analyze repository**. No repository files have been retrieved yet."
         )
-        return context, gr.update(visible=True), notice
     except Exception as exc:
-        logger.warning("Private repository verification failed (%s).", type(exc).__name__)
-        return None, gr.update(visible=False), (
-            "GitHub could not verify this PAT and repository. Check token permissions "
-            "and repository access. No repository contents were retrieved."
-        )
+        logger.warning("Private email approval request failed (%s): %s", type(exc).__name__, str(exc)[:300])
+        return None, "Could not send the approval request. Check the Brevo API key, verified sender, repository approver mapping, APP_BASE_URL, and database connection. No repository files were retrieved."
 
-def approve_private_access(verified_context, github_token, private_repository, question):
-    token_value = (github_token or "").strip()
-    selected = (private_repository or "").strip()
-    if not isinstance(verified_context, dict) or not token_value:
-        return None, "Verify the PAT and repository before approving access."
-    same_request = (
-        verified_context.get("repository") == selected
-        and verified_context.get("question") == (question or "").strip()
-        and hmac.compare_digest(
-            verified_context.get("token_fingerprint", ""),
-            _token_fingerprint(token_value),
-        )
-    )
-    if not same_request:
-        return None, "The PAT, repository or question changed. Verify again before approving."
-    approved = dict(verified_context)
-    approved["approved"] = True
-    return approved, (
-        f"**Access approved for `{selected}`.** Select **Analyze repository** to run "
-        "this approved analysis. Approval is consumed by that attempt."
-    )
-
-def decline_private_access():
-    return None, None, "Access declined. No private repository content was retrieved and no answer was generated."
 
 def invalidate_private_consent():
-    return None, None, "Request changed. Verify the repository and request consent again."
+    return None, "Request changed. Send a new email approval request before analyzing."
+
+
+def _approval_html(title: str, message: str, token: str = "", show_actions: bool = False):
+    actions = ""
+    if show_actions:
+        action_url = f"/email-approval/{token}/decision"
+        actions = (
+            f'<form method="post" action="{action_url}" style="display:flex;gap:12px;margin-top:24px">'
+            '<button name="decision" value="approved" style="padding:12px 20px;background:#16a34a;color:white;border:0;border-radius:8px;font-weight:bold">Approve access</button>'
+            '<button name="decision" value="rejected" style="padding:12px 20px;background:#dc2626;color:white;border:0;border-radius:8px;font-weight:bold">Reject access</button>'
+            '</form>'
+        )
+    return (
+        '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head>'
+        '<body style="font-family:Arial,sans-serif;background:#0b1020;color:#f8fafc;padding:32px">'
+        '<main style="max-width:640px;margin:40px auto;background:#1e293b;padding:28px;border-radius:14px">'
+        f'<h2>FreshTrust-MCP</h2><h3>{title}</h3><p>{message}</p>{actions}'
+        '</main></body></html>'
+    )
 
 
 # --------------------------------------------------
@@ -313,9 +315,9 @@ def ask(
         )
 
     if visibility == "Private":
-        valid_approval = (
+        valid_request = (
             isinstance(private_approval, dict)
-            and private_approval.get("approved") is True
+            and private_approval.get("request_id")
             and private_approval.get("repository") == selected
             and private_approval.get("question") == question.strip()
             and hmac.compare_digest(
@@ -323,12 +325,14 @@ def ask(
                 _token_fingerprint(github_token),
             )
         )
-        if not valid_approval:
+        if not valid_request or not consume_approved_request(
+            private_approval.get("request_id", "") if isinstance(private_approval, dict) else "",
+            selected, question.strip(), _token_fingerprint(github_token),
+        ):
             return (
-                "Private repository access has not been approved. Verify the repository, "
-                "review the access notice, and select Allow access before analyzing.",
+                "Email approval is still required, has expired, or does not match this request. Check your email and approve the exact repository request before analyzing.",
                 [], [], [], [], "Metrics will appear after a successful analysis.",
-                _history_rows(), "Consent required", None,
+                _history_rows(), "Email approval required", None,
             )
 
     try:
@@ -572,6 +576,7 @@ with gr.Blocks(
         visible=False,
     )
 
+
     with gr.Row():
         discover_button = gr.Button(
             "Discover private repositories",
@@ -590,15 +595,11 @@ with gr.Blocks(
     )
     discovery_status = gr.Markdown()
 
-    verified_private_context = gr.State(value=None)
     approved_private_context = gr.State(value=None)
     verify_private_button = gr.Button(
-        "Verify repository and request access approval", visible=False
+        "Verify repository and email approval request", visible=False
     )
-    consent_notice = gr.Markdown(visible=False)
-    with gr.Row(visible=False) as consent_actions:
-        approve_private_button = gr.Button("Allow access", variant="primary")
-        decline_private_button = gr.Button("Decline", variant="secondary")
+    consent_notice = gr.Markdown(visible=True)
 
     question = gr.Textbox(
         label="Ask about the repository",
@@ -760,25 +761,15 @@ with gr.Blocks(
         outputs=[verify_private_button],
     )
     visibility.change(
-        fn=decline_private_access,
+        fn=invalidate_private_consent,
         inputs=[],
-        outputs=[verified_private_context, approved_private_context, consent_notice],
+        outputs=[approved_private_context, consent_notice],
     )
 
     verify_private_button.click(
-        fn=verify_private_repository,
+        fn=request_private_email_approval,
         inputs=[token, private_repo, question],
-        outputs=[verified_private_context, consent_actions, consent_notice],
-    )
-    approve_private_button.click(
-        fn=approve_private_access,
-        inputs=[verified_private_context, token, private_repo, question],
         outputs=[approved_private_context, consent_notice],
-    )
-    decline_private_button.click(
-        fn=decline_private_access,
-        inputs=[],
-        outputs=[verified_private_context, approved_private_context, consent_notice],
     )
 
     # Editing any request input invalidates verification and approval.
@@ -786,13 +777,13 @@ with gr.Blocks(
         component.change(
             fn=invalidate_private_consent,
             inputs=[],
-            outputs=[verified_private_context, approved_private_context, consent_notice],
+            outputs=[approved_private_context, consent_notice],
         )
 
     clear.click(
-        fn=decline_private_access,
+        fn=invalidate_private_consent,
         inputs=[],
-        outputs=[verified_private_context, approved_private_context, consent_notice],
+        outputs=[approved_private_context, consent_notice],
     )
 
     submit.click(
@@ -808,8 +799,43 @@ with gr.Blocks(
     )
 
 
-# Host Gradio through FastAPI. No administrator OAuth callback is required.
+# Email approval endpoints are registered before the Gradio catch-all mount.
 app = FastAPI(title="FreshTrust-MCP API")
+
+
+@app.get("/email-approval/{token}", response_class=HTMLResponse)
+async def email_approval_landing(token: str):
+    # GET is read-only: email security scanners may open links automatically.
+    record = get_approval_page(token)
+    if not record:
+        return HTMLResponse(_approval_html("Invalid approval link", "This approval link is invalid."), status_code=404)
+    if record.get("status") != "pending":
+        return HTMLResponse(_approval_html("Request unavailable", "This request has expired or has already been decided."), status_code=410)
+    repository = html.escape(record["repository"])
+    return HTMLResponse(_approval_html(
+        "Review private repository access",
+        f"You are being asked to approve read-only analysis of <strong>{repository}</strong>. Choose Approve or Reject below. Opening this page alone does not approve access.",
+        token=token, show_actions=True,
+    ))
+
+
+@app.post("/email-approval/{token}/decision", response_class=HTMLResponse)
+async def email_approval_decision(token: str, request: Request):
+    body = (await request.body()).decode("utf-8", errors="replace")
+    decision = parse_qs(body).get("decision", [""])[0]
+    if decision not in {"approved", "rejected"}:
+        return HTMLResponse(_approval_html("Invalid decision", "Choose Approve or Reject."), status_code=400)
+    if not decide_approval(token, decision):
+        return HTMLResponse(_approval_html("Request unavailable", "This link is invalid, expired, or has already been used."), status_code=410)
+    if decision == "approved":
+        title = "Access approved"
+        message = "Access approved. Return to FreshTrust-MCP and click Analyze repository to start retrieval and answer generation."
+    else:
+        title = "Access rejected"
+        message = "Access rejected. No private repository retrieval or answer generation will occur."
+    return HTMLResponse(_approval_html(title, message))
+
+
 app = gr.mount_gradio_app(app, demo, path="/")
 
 @app.on_event("startup")
