@@ -67,17 +67,19 @@ def _server_parameters(token: Optional[str] = None, public_oauth: bool = False):
     """
     Build stdio parameters for the official GitHub MCP Server.
 
-    Private-repository requests launch the native executable bundled in the
-    Render Docker image. The PAT is passed only to this request-scoped child
-    process; it is not written to disk or added to Render's environment.
+    On Windows/local development, Docker Desktop launches the official MCP
+    container. On the Render Docker image, the bundled native executable is
+    launched directly. A private PAT is passed only to the request-scoped
+    child process and is never written to disk or logged.
 
-    The legacy public_oauth/Docker branch is retained for compatibility with
-    _PersistentPublicMCP. The active public-repository retrieval path does not
-    use that helper and remains unchanged.
+    The legacy public_oauth branch is retained for compatibility with
+    _PersistentPublicMCP. The active public-repository retrieval path remains
+    the anonymous GitHub REST/raw HTTPS implementation.
     """
+    env = os.environ.copy()
+    env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
+
     if public_oauth:
-        env = os.environ.copy()
-        env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
         port = settings.github_mcp_oauth_callback_port
         env["GITHUB_OAUTH_CALLBACK_PORT"] = str(port)
         args = [
@@ -93,24 +95,41 @@ def _server_parameters(token: Optional[str] = None, public_oauth: bool = False):
             env=env,
         )
 
+    env["GITHUB_TOOLSETS"] = settings.github_mcp_toolsets
+    if token and token.strip():
+        env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token.strip()
+
+    # Windows local development: use Docker Desktop because the Render
+    # executable path (/usr/local/bin/...) is not available on Windows.
+    use_docker = os.name == "nt" or os.getenv("GITHUB_MCP_USE_DOCKER", "").lower() in {
+        "1", "true", "yes"
+    }
+
+    if use_docker:
+        args = [
+            "run", "-i", "--rm",
+            "-e", "GITHUB_TOOLSETS",
+            "-e", "GITHUB_PERSONAL_ACCESS_TOKEN",
+            settings.github_mcp_image,
+            "stdio", "--read-only",
+        ]
+        return StdioServerParameters(
+            command=settings.github_mcp_docker_command,
+            args=args,
+            env=env,
+        )
+
+    # Render/Linux deployment: use the native executable built into the image.
     binary_path = os.getenv(
         "GITHUB_MCP_BINARY_PATH",
         "/usr/local/bin/github-mcp-server",
     )
-
-    env = os.environ.copy()
-    env.pop("GITHUB_PERSONAL_ACCESS_TOKEN", None)
-    env["GITHUB_TOOLSETS"] = settings.github_mcp_toolsets
-    env["GITHUB_READ_ONLY"] = "1"
-
-    if token and token.strip():
-        env["GITHUB_PERSONAL_ACCESS_TOKEN"] = token.strip()
-
     return StdioServerParameters(
         command=binary_path,
-        args=["stdio"],
+        args=["stdio", "--read-only"],
         env=env,
     )
+
 
 
 def _tool_schema(tool: Any) -> Dict[str, Any]:
@@ -574,12 +593,31 @@ class GitHubMCPClient:
             return await asyncio.to_thread(
                 _retrieve_public_sync, owner, repo, question or "", max_files
             )
-        except (GitHubMCPAuthenticationRequired, PermissionError, ValueError):
-            raise
         except Exception as exc:
-            log.error("Public GitHub MCP retrieval failed (%s).", type(exc).__name__)
+            detail = " ".join(str(exc).split())
+
+            # Redact token-shaped strings before logging.
+            detail = re.sub(
+                r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})\b",
+                "[REDACTED_GITHUB_TOKEN]",
+                detail,
+            )
+            detail = re.sub(
+                r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+                r"\1[REDACTED]",
+                detail,
+            )
+
+            log.error(
+                "Public GitHub retrieval failed for %s/%s (%s): %s",
+                owner,
+                repo,
+                type(exc).__name__,
+                detail[:400] or "No exception detail was provided.",
+            )
+
             raise RuntimeError(
-                "Anonymous public GitHub retrieval failed. Verify that the repository is public and the URL is correct."
+                "Anonymous public GitHub retrieval failed. Check the Render service logs for the diagnostic reason."
             ) from None
 
 
