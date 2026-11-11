@@ -1,4 +1,3 @@
-
 import time
 
 import numpy as np
@@ -51,9 +50,9 @@ def rank_repository(
         similarities = np.dot(vectors[1:], vectors[0])
 
         embedding_mode = (
-            "sentence_transformer_cached"
+            "cloudflare_workers_ai_cached"
             if cache_embeddings
-            else "sentence_transformer_uncached"
+            else "cloudflare_workers_ai_uncached"
         )
 
     except Exception:

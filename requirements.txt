@@ -1,7 +1,6 @@
 gradio>=5.0,<6
 mcp>=1.9,<2
 langgraph>=0.2,<2
-sentence-transformers>=3.0,<6
 numpy>=1.26,<3
 requests>=2.31,<3
 cryptography>=42,<46

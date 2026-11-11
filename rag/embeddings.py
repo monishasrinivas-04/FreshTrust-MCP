@@ -1,27 +1,30 @@
+"""Cloudflare Workers AI embeddings with public-only persistent caching."""
 
-from functools import lru_cache
 from hashlib import sha256
+import os
 from pathlib import Path
 import sqlite3
 
 import numpy as np
+import requests
 
 from config.settings import settings
 
 
 CACHE_DB = Path(".cache") / "freshtrust_embeddings.sqlite3"
-
-
-@lru_cache(maxsize=1)
-def get_embedder():
-    """Load the embedding model once per application process."""
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(settings.embedding_model, device="cpu")
+EMBEDDING_MODEL = os.getenv(
+    "CLOUDFLARE_EMBEDDING_MODEL",
+    "@cf/baai/bge-small-en-v1.5",
+)
+EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_TIMEOUT_SECONDS = 60
 
 
 def _cache_key(text: str) -> str:
-    model_name = str(settings.embedding_model)
-    return sha256(f"{model_name}\0{text}".encode("utf-8")).hexdigest()
+    # Include the hosted model ID so vectors from different models never mix.
+    return sha256(
+        f"{EMBEDDING_MODEL}\0{text}".encode("utf-8")
+    ).hexdigest()
 
 
 def _connect_cache():
@@ -86,33 +89,119 @@ def _write_cached(items):
             )
 
     except (sqlite3.Error, OSError):
+        # Caching is an optimization; embedding generation can still succeed.
         pass
+
+
+def _normalize_vectors(vectors, expected_count):
+    try:
+        result = np.asarray(vectors, dtype=np.float32)
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            "Cloudflare returned embeddings in an invalid format."
+        ) from None
+
+    if result.ndim != 2 or result.shape[0] != expected_count:
+        raise RuntimeError(
+            "Cloudflare returned an unexpected number or shape of embeddings."
+        )
+
+    if result.shape[1] == 0 or not np.all(np.isfinite(result)):
+        raise RuntimeError("Cloudflare returned invalid embedding values.")
+
+    # Match the previous SentenceTransformer normalize_embeddings=True behavior.
+    norms = np.linalg.norm(result, axis=1, keepdims=True)
+    if np.any(norms <= 0):
+        raise RuntimeError("Cloudflare returned a zero-length embedding.")
+
+    return result / norms
+
+
+def _cloudflare_embed_batch(texts):
+    if not settings.cloudflare_account_id or not settings.cloudflare_api_token:
+        raise RuntimeError(
+            "Cloudflare Workers AI embeddings are not configured. "
+            "Check CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_API_TOKEN."
+        )
+
+    url = (
+        "https://api.cloudflare.com/client/v4/accounts/"
+        f"{settings.cloudflare_account_id}/ai/run/{EMBEDDING_MODEL}"
+    )
+    headers = {
+        "Authorization": f"Bearer {settings.cloudflare_api_token}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json={"text": texts},
+            timeout=EMBEDDING_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        raise RuntimeError(
+            "Cloudflare Workers AI embeddings endpoint is unreachable."
+        ) from None
+
+    if not response.ok:
+        raise RuntimeError(
+            f"Cloudflare Workers AI embeddings returned HTTP {response.status_code}."
+        )
+
+    try:
+        payload = response.json()
+    except ValueError:
+        raise RuntimeError(
+            "Cloudflare Workers AI returned an invalid embeddings response."
+        ) from None
+
+    if not isinstance(payload, dict) or not payload.get("success"):
+        raise RuntimeError(
+            "Cloudflare Workers AI did not successfully generate embeddings."
+        )
+
+    result = payload.get("result") or {}
+    vectors = result.get("data") if isinstance(result, dict) else None
+
+    if not isinstance(vectors, list):
+        raise RuntimeError(
+            "Cloudflare Workers AI response did not contain embedding vectors."
+        )
+
+    return _normalize_vectors(vectors, len(texts))
+
+
+def _generate_embeddings(texts):
+    """Generate hosted embeddings in bounded batches."""
+    batches = []
+
+    for start in range(0, len(texts), EMBEDDING_BATCH_SIZE):
+        batch = texts[start:start + EMBEDDING_BATCH_SIZE]
+        batches.append(_cloudflare_embed_batch(batch))
+
+    if not batches:
+        return np.empty((0, 0), dtype=np.float32)
+
+    return np.vstack(batches).astype(np.float32, copy=False)
 
 
 def embed_texts(texts, use_cache=True):
     """
-    Return normalized embeddings.
+    Return normalized Cloudflare embeddings.
 
-    When use_cache=False, bypass persistent SQLite storage entirely.
+    Public requests may use the persistent SQLite cache. Private requests pass
+    use_cache=False and bypass persistent storage completely.
     """
     texts = [str(text) for text in texts]
 
     if not texts:
         return np.empty((0, 0), dtype=np.float32)
 
-    # Private requests bypass persistent storage completely.
+    # Private repository embeddings are never written to the persistent cache.
     if not use_cache:
-        model = get_embedder()
-
-        vectors = model.encode(
-            texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-            batch_size=32,
-        )
-
-        return np.asarray(vectors, dtype=np.float32)
+        return _generate_embeddings(texts)
 
     keys = [_cache_key(text) for text in texts]
     cached = _read_cached(list(dict.fromkeys(keys)))
@@ -128,20 +217,7 @@ def embed_texts(texts, use_cache=True):
             seen_missing.add(key)
 
     if missing_texts:
-        model = get_embedder()
-
-        vectors = model.encode(
-            missing_texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True,
-            show_progress_bar=False,
-            batch_size=32,
-        )
-
-        vectors = np.asarray(vectors, dtype=np.float32)
-
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
+        vectors = _generate_embeddings(missing_texts)
 
         new_vectors = {
             key: vector for key, vector in zip(missing_keys, vectors)
@@ -156,7 +232,7 @@ def embed_texts(texts, use_cache=True):
 
 
 def lexical_fallback(query, texts):
-    """Deterministic fallback if the embedding package cannot initialize."""
+    """Deterministic fallback if the hosted embedding service is unavailable."""
     q = set(query.lower().split())
     scores = []
 
