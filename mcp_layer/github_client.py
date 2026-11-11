@@ -155,33 +155,57 @@ def _text(result: Any) -> str:
         )
 
 
+
 def _raise_if_auth_challenge(value: Any) -> None:
     text = value if isinstance(value, str) else str(value)
     lowered = text.lower()
-    auth_words = (
-        "authorize", "authorization", "device code", "sign in to github",
-        "authenticate", "oauth", "login to github",
+
+    # Only recognize actual GitHub OAuth/device authorization URLs.
+    urls = re.findall(
+        r"https://(?:github\.com|githubcopilot\.com)/[^\s<>\"']+",
+        text,
+        flags=re.IGNORECASE,
     )
-    if not any(word in lowered for word in auth_words):
+
+    auth_url = next(
+        (
+            url.rstrip(".,;:)]")
+            for url in urls
+            if re.search(
+                r"/login/(?:device|oauth/authorize)(?:[/?#]|$)",
+                url,
+                flags=re.IGNORECASE,
+            )
+        ),
+        "",
+    )
+
+    # Require an actual authorization URL and explicit authentication
+    # challenge wording. Ordinary repository content is not an auth challenge.
+    challenge_markers = (
+        "device authorization",
+        "enter the code",
+        "verification code",
+        "authorize this application",
+        "sign in to github to continue",
+    )
+
+    if not auth_url or not any(
+        marker in lowered for marker in challenge_markers
+    ):
         return
-    urls = re.findall(r"https://(?:github\.com|githubcopilot\.com)/[^\s<>\]\)\"']+", text)
-    url = next((u.rstrip(".,;:") for u in urls if "login" in u.lower() or "authorize" in u.lower() or "device" in u.lower()), "")
-    if not url:
-        url = next((u.rstrip(".,;:") for u in urls), "")
+
     message = (
-        "GitHub authorization is required for the public MCP connection. "
-        "Open the authorization link shown below and approve access. The browser "
-        "must be able to reach the Docker-published callback at localhost:8085. "
-        "After approval, return to FreshTrust and submit the question again. "
-        "The public MCP connection stays alive while this FreshTrust process runs."
+        "GitHub MCP returned an interactive OAuth challenge, although "
+        "FreshTrust should authenticate this private request using its "
+        "request-scoped GitHub PAT. Verify that the PAT is accepted and "
+        "has access to this repository."
     )
-    if url:
-        message += f"\n\n[Open GitHub authorization]({url})"
-    else:
-        # Keep the server's instructions visible, but do not mistake them for files.
-        safe_text = text[:1200]
-        message += f"\n\nGitHub MCP response:\n{safe_text}"
-    raise GitHubMCPAuthenticationRequired(message, url)
+
+    message += f"\n\n[Open GitHub authorization]({auth_url})"
+
+    raise GitHubMCPAuthenticationRequired(message, auth_url)
+
 
 
 def _decode_payload(result: Any) -> Any:
