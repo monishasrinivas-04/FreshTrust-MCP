@@ -282,8 +282,23 @@ async def _discover_repositories_async(token: str) -> List[Dict[str, Any]]:
             me_tool = _find_tool(tools, "get_me")
             search_tool = _find_tool(tools, "search_repositories")
             me_result = await session.call_tool(me_tool.name, arguments={})
+
             if getattr(me_result, "isError", False):
-                raise PermissionError("GitHub rejected the supplied token.")
+                    detail = _text(me_result).strip()
+
+                    if not detail:
+                        detail = "GitHub MCP returned an error without details."
+
+                    # Prevent accidental exposure of GitHub tokens in error messages.
+                    detail = re.sub(
+                        r"(?i)\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9]+)\b",
+                        "[REDACTED]",
+                        detail,
+                    )
+
+                    raise PermissionError(
+                        f"GitHub MCP get_me failed: {detail[:1000]}"
+                    )
             result = await session.call_tool(search_tool.name, arguments=_build_discovery_args(search_tool))
             if getattr(result, "isError", False):
                 _raise_if_auth_challenge(_text(result))
@@ -559,6 +574,11 @@ class GitHubMCPClient:
     def discover_repositories(token: str) -> List[Dict[str, Any]]:
         return discover_repositories(token)
 
+    @staticmethod
+    def get_repository_owner_email(token: str, repository_full_name: str) -> str:
+        """Resolve an email belonging to the personal repo owner or an org owner."""
+        return _get_repository_owner_email(token, repository_full_name)
+
     async def retrieve(
         self,
         owner: str,
@@ -583,9 +603,42 @@ class GitHubMCPClient:
             except GitHubMCPAuthenticationRequired:
                 raise
             except Exception as exc:
-                log.error("Private GitHub MCP retrieval failed (%s).", type(exc).__name__)
+
+                def describe_exception(error):
+                    if isinstance(error, BaseExceptionGroup):
+                        return " | ".join(
+                            describe_exception(child)
+                            for child in error.exceptions
+                        )
+
+                    detail = " ".join(str(error).split())
+
+                    # Redact GitHub PATs before writing diagnostic information to logs.
+                    detail = re.sub(
+                        r"(?i)\b(?:gh[pousr]_[A-Za-z0-9_]{10,}|github_pat_[A-Za-z0-9_]{10,})\b",
+                        "[REDACTED_GITHUB_TOKEN]",
+                        detail,
+                    )
+
+                    detail = re.sub(
+                        r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+",
+                        r"\1[REDACTED]",
+                        detail,
+                    )
+
+                    return f"{type(error).__name__}: {detail[:500]}"
+
+                error_details = describe_exception(exc)
+
+                log.error(
+                    "Private GitHub MCP retrieval failed for %s/%s: %s",
+                    owner,
+                    repo,
+                    error_details[:2000],
+                )
+
                 raise RuntimeError(
-                    "Private GitHub MCP retrieval failed. Verify PAT permissions and repository access."
+                    "Private GitHub MCP retrieval failed. Check the application logs for the diagnostic reason."
                 ) from None
 
         # Run the synchronous bridge away from LangGraph's asyncio event loop.
@@ -644,6 +697,146 @@ def _github_json(url: str, token: Optional[str] = None) -> Any:
         raise RuntimeError(f"GitHub API request failed with HTTP {exc.code}.") from None
     except (URLError, TimeoutError) as exc:
         raise RuntimeError(f"Could not connect to GitHub ({type(exc).__name__}).") from None
+
+
+def _is_valid_github_email(value: Any) -> bool:
+    return isinstance(value, str) and bool(
+        re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value.strip())
+    )
+
+
+def _get_verified_pat_email(token: str) -> str:
+    """Return the primary verified email belonging to the PAT's authenticated user."""
+    try:
+        email_records = _github_json(
+            "https://api.github.com/user/emails?per_page=100", token=token
+        )
+    except Exception:
+        raise PermissionError(
+            "GitHub did not allow FreshTrust to read the PAT owner's email addresses. "
+            "For a classic PAT, grant the user:email scope. For a fine-grained PAT, "
+            "grant the Email addresses user permission (read). Also check organization "
+            "SSO authorization and GitHub API rate limits."
+        ) from None
+
+    if not isinstance(email_records, list):
+        raise PermissionError("GitHub returned an unexpected email-address response.")
+
+    verified = [
+        item for item in email_records
+        if isinstance(item, dict)
+        and item.get("verified") is True
+        and _is_valid_github_email(item.get("email"))
+    ]
+    if not verified:
+        raise PermissionError(
+            "GitHub did not return a verified email address for the authenticated PAT account. "
+            "Verify an email address in GitHub and grant the PAT email-read permission."
+        )
+
+    primary = next((item for item in verified if item.get("primary") is True), None)
+    return (primary or verified[0])["email"].strip()
+
+
+def _get_repository_owner_email(token: str, repository_full_name: str) -> str:
+    """Resolve the actual repository owner's email without guessing or using UI input.
+
+    Personal repositories:
+      - If the PAT belongs to the repository owner, use that account's primary
+        verified email from GET /user/emails.
+      - If the PAT belongs to a collaborator, use only the owner's public
+        GitHub-profile email. GitHub does not expose another user's private email.
+
+    Organization repositories:
+      - Require the PAT account to be an active organization owner (role=admin),
+        then use that owner's primary verified email.
+    """
+    secret = (token or "").strip()
+    full_name = (repository_full_name or "").strip()
+    if not secret:
+        raise PermissionError("A GitHub PAT is required to resolve the repository owner email.")
+
+    parts = full_name.split("/", 1)
+    if len(parts) != 2 or not all(parts):
+        raise ValueError("Repository must be supplied as owner/repository.")
+    requested_owner, requested_repo = parts
+
+    repository_data = _github_json(
+        f"https://api.github.com/repos/{quote(requested_owner)}/{quote(requested_repo)}",
+        token=secret,
+    )
+    if repository_data.get("private") is not True:
+        raise PermissionError("The selected repository is not private.")
+
+    owner_data = repository_data.get("owner") or {}
+    owner_login = owner_data.get("login")
+    owner_type = (owner_data.get("type") or "").strip().lower()
+    if not owner_login or owner_type not in {"user", "organization"}:
+        raise RuntimeError("GitHub did not return a supported repository-owner identity.")
+
+    authenticated_user = _github_json("https://api.github.com/user", token=secret)
+    authenticated_login = (authenticated_user.get("login") or "").strip()
+    if not authenticated_login:
+        raise PermissionError("GitHub could not identify the account associated with this PAT.")
+
+    if owner_type == "user":
+        if authenticated_login.casefold() == owner_login.casefold():
+            # The PAT belongs to the repository owner. Prefer a verified account email.
+            try:
+                return _get_verified_pat_email(secret)
+            except PermissionError as email_error:
+                # A public profile email is an acceptable fallback only if GitHub
+                # explicitly publishes it; never substitute a collaborator's email.
+                try:
+                    profile = _github_json(
+                        f"https://api.github.com/users/{quote(owner_login)}", token=secret
+                    )
+                except Exception:
+                    raise email_error
+                public_email = profile.get("email") if isinstance(profile, dict) else None
+                if _is_valid_github_email(public_email):
+                    return public_email.strip()
+                raise email_error
+
+        # The PAT belongs to a collaborator, not the personal repository owner.
+        # Only use an email the owner has explicitly made public on GitHub.
+        owner_profile = _github_json(
+            f"https://api.github.com/users/{quote(owner_login)}", token=secret
+        )
+        public_email = owner_profile.get("email") if isinstance(owner_profile, dict) else None
+        if _is_valid_github_email(public_email):
+            return public_email.strip()
+        raise PermissionError(
+            f"The entered PAT belongs to @{authenticated_login}, but the repository is owned by "
+            f"@{owner_login}. GitHub does not disclose that owner's private email to collaborators. "
+            "Use a PAT belonging to the repository owner with email-read permission, or ask the "
+            "owner to make a contact email public on their GitHub profile. No email was sent."
+        )
+
+    # Organization-owned repository: a member PAT is not enough to identify an
+    # authorized approver. Verify that the PAT account is an active org owner.
+    try:
+        membership = _github_json(
+            f"https://api.github.com/user/memberships/orgs/{quote(owner_login)}",
+            token=secret,
+        )
+    except Exception:
+        raise PermissionError(
+            f"{owner_login} is an organization. To send approval to an organization owner, "
+            "the PAT account must be an active organization owner and the token must be able "
+            "to read organization membership (classic PAT: read:org; fine-grained PAT: "
+            "Members organization permission read). GitHub does not expose private emails "
+            "of other organization owners. No email was sent."
+        ) from None
+
+    if membership.get("state") != "active" or membership.get("role") != "admin":
+        raise PermissionError(
+            f"The PAT account @{authenticated_login} is not an active owner of organization "
+            f"{owner_login}. A repository member/collaborator cannot retrieve an owner's private "
+            "email through GitHub. Use an active organization-owner PAT. No email was sent."
+        )
+
+    return _get_verified_pat_email(secret)
 
 
 def _latest_file_commit(owner: str, repo: str, path: str, token: Optional[str] = None):

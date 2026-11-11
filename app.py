@@ -33,7 +33,6 @@ from security.redaction import redact
 from security.email_approval import (
     create_pending_approval, send_approval_email, get_approval_page,
     decide_approval, consume_approved_request, mark_email_failed,
-    get_repository_approver_email,
 )
 
 
@@ -89,7 +88,7 @@ def toggle_repository_mode(visibility):
             gr.update(visible=True, value=None, choices=[]),
             gr.update(visible=True, value=""),
             gr.update(visible=True),
-            "Private mode: enter your PAT, discover and select a repository. Approval is sent to the server-configured repository owner/admin.",
+            "Private mode: use a PAT with access to the repository and permission to read the GitHub owner email (classic PAT: user:email; fine-grained PAT: Email addresses read). Organization repositories also require the PAT user to be an active org owner.",
         )
     return (
         gr.update(visible=True, value=""),
@@ -124,12 +123,9 @@ def discover_private_repositories(github_token):
             f"Found **{len(choices)}** accessible private repositories. Select one below.",
         )
     except Exception as exc:
-        # Never log the PAT or raw subprocess environment.
-        logger.warning(
-            "Private repository discovery failed (%s).",
-            type(exc).__name__,
-        )
-        return (
+         logger.exception("Private repository discovery failed")
+
+    return(
             gr.update(choices=[], value=None),
             "Repository discovery failed. Verify the PAT permissions and Docker "
             "GitHub MCP Server connection, then try again.",
@@ -140,7 +136,7 @@ def _token_fingerprint(token):
     return hashlib.sha256((token or "").strip().encode("utf-8")).hexdigest()
 
 def request_private_email_approval(github_token, private_repository, question):
-    """Verify PAT access without reading files, then email the configured repo admin."""
+    """Verify PAT access and resolve the repository owner's eligible GitHub email without reading files."""
     token_value = (github_token or "").strip()
     selected = (private_repository or "").strip()
     if not token_value:
@@ -149,21 +145,36 @@ def request_private_email_approval(github_token, private_repository, question):
         return None, "Select a private repository first."
     if not question or not question.strip():
         return None, "Enter your question before requesting approval."
+
     try:
-        approver_email = get_repository_approver_email(selected)
+        # This checks the PAT's repository access using repository metadata only.
+        # No source files are retrieved before the email approval is granted.
         repositories = GitHubMCPClient.discover_repositories(token_value)
         accessible = {item.get("full_name", "").casefold() for item in repositories}
         if selected.casefold() not in accessible:
-            return None, "The selected repository is not accessible with this PAT. No repository contents were retrieved and no email was sent."
+            return None, (
+                "The selected repository is not accessible with this PAT. "
+                "No repository contents were retrieved and no email was sent."
+            )
+
+        # Resolve the owner/admin email from GitHub using this PAT; no email
+        # address is supplied by the UI or stored in server-side mapping config.
+        approver_email = GitHubMCPClient.get_repository_owner_email(
+            token_value, selected
+        )
+
         request_id, raw_token = create_pending_approval(
-            approver_email=approver_email, repository=selected,
-            question=question, pat_fingerprint=_token_fingerprint(token_value),
+            approver_email=approver_email,
+            repository=selected,
+            question=question,
+            pat_fingerprint=_token_fingerprint(token_value),
         )
         try:
             send_approval_email(approver_email, selected, question, raw_token)
         except Exception:
             mark_email_failed(request_id)
             raise
+
         request_context = {
             "request_id": request_id,
             "repository": selected,
@@ -171,14 +182,23 @@ def request_private_email_approval(github_token, private_repository, question):
             "token_fingerprint": _token_fingerprint(token_value),
         }
         return request_context, (
-            f"**Owner/admin approval email sent to `{approver_email}`.** "
-            f"The configured approver must approve or reject access to `{selected}`. "
+            f"**GitHub owner/admin approval email sent to `{approver_email}`.** "
+            f"The recipient must explicitly approve or reject access to `{selected}`. "
             "The link expires in 10 minutes. After approval, return here and "
             "click **Analyze repository**. No repository files have been retrieved yet."
         )
     except Exception as exc:
-        logger.warning("Private email approval request failed (%s): %s", type(exc).__name__, str(exc)[:300])
-        return None, "Could not send the approval request. Check the Brevo API key, verified sender, repository approver mapping, APP_BASE_URL, and database connection. No repository files were retrieved."
+        # Redact before logging/displaying; never expose the PAT.
+        safe_error = redact(str(exc))[:350]
+        logger.warning(
+            "Private email approval request failed (%s): %s",
+            type(exc).__name__,
+            safe_error,
+        )
+        return None, (
+            "Could not send the approval request. No repository files were retrieved. "
+            f"**Details:** `{safe_error}`"
+        )
 
 
 def invalidate_private_consent():
